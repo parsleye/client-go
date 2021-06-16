@@ -16,6 +16,7 @@ package tikv
 import (
 	"bytes"
 	"context"
+	"log"
 	"time"
 
 	"github.com/kjzz/client-go/config"
@@ -26,7 +27,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/pd/client"
-	"fmt"
 )
 
 var ErrInitIterator = errors.New("failed to init iterator")
@@ -506,6 +506,108 @@ func (c *RawKVClient) sendDeleteRangeReq(startKey []byte, endKey []byte) (*rpc.R
 	}
 }
 
+type BatchType int
+
+const (
+	BatchTypePut BatchType = iota
+	BatchTypeDel
+)
+
+func (bt BatchType) valid() bool {
+	return bt >= BatchTypePut && bt <= BatchTypeDel
+}
+
+func (bt BatchType) typePut() bool {
+	return bt == BatchTypePut
+}
+
+func (bt BatchType) typeDel() bool {
+	return bt == BatchTypeDel
+}
+
+type RegionBatch struct {
+	regionID locate.RegionVerID
+	keys     [][]byte
+	values   [][]byte
+	size     int
+	pair     int
+	full     bool
+	typ      BatchType
+}
+
+func NewRegionBatch(regionID locate.RegionVerID, t BatchType) *RegionBatch {
+	if !t.valid() {
+		log.Fatal("invalid region batch type")
+		return nil
+	}
+	return &RegionBatch{
+		regionID: regionID,
+		keys:     make([][]byte, 0),
+		values:   make([][]byte, 0),
+		typ:      t,
+	}
+}
+
+func (batch *RegionBatch) Put(key, value []byte) error {
+	if batch.typ.typePut() {
+		batch.keys = append(batch.keys, key)
+		batch.values = append(batch.values, value)
+		batch.size += len(key) + len(value)
+		batch.pair++
+		batch.full = batch.size > rawBatchPutSize
+		return nil
+	}
+	return errors.New("expect put in region put batch")
+}
+
+func (batch *RegionBatch) Delete(key []byte) error {
+	if batch.typ.typeDel() {
+		batch.keys = append(batch.keys, key)
+		batch.size += len(key)
+		batch.pair++
+		batch.full = batch.pair > rawBatchPairCount
+		return nil
+	}
+	return errors.New("expect delete in region del batch")
+}
+
+func (batch *RegionBatch) Full() bool {
+	return batch.full
+}
+
+func (c *RawKVClient) GetKeyRegion(bo *retry.Backoffer, key []byte) (*locate.KeyLocation, error) {
+	return c.regionCache.LocateKey(bo, key)
+}
+
+func (c *RawKVClient) WriteRegionBatch(bo *retry.Backoffer, b *RegionBatch) (err error) {
+	if !b.typ.valid() {
+		return errors.New("invalid region batch type")
+	}
+	if b.pair <= 0 || b.size <= 0 {
+		return errors.New("invalid region batch")
+	}
+	batch := batch{
+		regionID: b.regionID,
+		keys:     b.keys,
+		values:   b.values,
+	}
+	bo, cancel := bo.Fork()
+	if b.typ == BatchTypePut {
+		err = c.doBatchPut(bo, batch)
+		if err != nil {
+			cancel()
+			return err
+		}
+	} else {
+		resp := c.doBatchReq(bo, batch, rpc.CmdRawBatchDelete)
+		if resp.err != nil {
+			cancel()
+			return resp.err
+		}
+	}
+	return nil
+}
+
 func (c *RawKVClient) sendBatchPut(bo *retry.Backoffer, keys, values [][]byte) error {
 	keyToValue := make(map[string][]byte)
 	for i, key := range keys {
@@ -624,6 +726,13 @@ func (c *RawKVClient) doBatchPut(bo *retry.Backoffer, batch batch) error {
 	return nil
 }
 
+func (c *RawKVClient) NewIterator(startKey, endKey []byte, batchSize int, version uint64) (*Iterator, error) {
+	if c == nil {
+		return nil, errNilClient
+	}
+	return NewIterator(startKey, endKey, batchSize, c, version)
+}
+
 type batch struct {
 	regionID locate.RegionVerID
 	keys     [][]byte
@@ -681,7 +790,7 @@ func NewIterator(startKey, endKey []byte, batchSize int, client *RawKVClient, ve
 	for {
 		err := iterator.getData(bo, true)
 		if err != nil {
-			if err == errNoMoreRequiredDataFromTikv{
+			if err == errNoMoreRequiredDataFromTikv {
 				break
 			}
 			return nil, err
@@ -706,14 +815,14 @@ func NewIterator(startKey, endKey []byte, batchSize int, client *RawKVClient, ve
 }
 
 func (it *Iterator) Key() []byte {
-	if it.idx<len(it.cache) && it.idx >= 0 && it.valid && !it.atEnd {
+	if it.idx < len(it.cache) && it.idx >= 0 && it.valid && !it.atEnd {
 		return it.cache[it.idx].Key
 	}
 	return nil
 }
 
 func (it *Iterator) Value() []byte {
-	if it.idx<len(it.cache) && it.idx >= 0 && it.valid && !it.atEnd {
+	if it.idx < len(it.cache) && it.idx >= 0 && it.valid && !it.atEnd {
 		return it.cache[it.idx].Value
 	}
 	return nil
@@ -721,21 +830,21 @@ func (it *Iterator) Value() []byte {
 
 func (it *Iterator) Seek(key []byte) bool {
 	bo := retry.NewBackoffer(context.WithValue(context.Background(), txnStartKey, it.version), scannerNextMaxBackoff)
-	if it.startKeys == nil || len(it.startKeys) == 0{
+	if it.startKeys == nil || len(it.startKeys) == 0 {
 		return false
 	}
 	if bytes.Compare(key, it.lastValidKey) > 0 {
 		it.Seek(it.lastValidKey)
 		return it.Next()
 	}
-	if bytes.Compare(key, it.startKeys[0]) < 0{
+	if bytes.Compare(key, it.startKeys[0]) < 0 {
 		return it.Seek(it.startKeys[0])
 	}
 
 	i := 0
-	for i = 1; i < len(it.startKeys); i++{
-		if bytes.Compare(key, it.startKeys[i]) < 0{
-			if bytes.Compare(key, it.endKeys[i-1]) > 0{
+	for i = 1; i < len(it.startKeys); i++ {
+		if bytes.Compare(key, it.startKeys[i]) < 0 {
+			if bytes.Compare(key, it.endKeys[i-1]) > 0 {
 				it.nextStartKey = it.startKeys[i]
 				err := it.getData(bo, false)
 				if err != nil {
@@ -751,7 +860,7 @@ func (it *Iterator) Seek(key []byte) bool {
 			break
 		}
 	}
-	if i == len(it.startKeys){
+	if i == len(it.startKeys) {
 		it.nextStartKey = it.startKeys[i-1]
 		err := it.getData(bo, false)
 		if err != nil {
@@ -759,8 +868,8 @@ func (it *Iterator) Seek(key []byte) bool {
 		}
 	}
 
-	for offset, k := range it.cache{
-		if bytes.Compare(key, k.Key) <= 0{
+	for offset, k := range it.cache {
+		if bytes.Compare(key, k.Key) <= 0 {
 			it.idx = offset
 			if it.atEnd {
 				it.unMarkAtEnd()
@@ -772,21 +881,19 @@ func (it *Iterator) Seek(key []byte) bool {
 	return false
 }
 
-func (it *Iterator) First() bool{
-	if it.startKeys == nil || len(it.startKeys) == 0{
+func (it *Iterator) First() bool {
+	if it.startKeys == nil || len(it.startKeys) == 0 {
 		return false
 	}
 	return it.Seek(it.startKeys[0])
 }
 
-
-func (it *Iterator) Last() bool{
-	if it.lastValidKey == nil || len(it.lastValidKey) == 0{
+func (it *Iterator) Last() bool {
+	if it.lastValidKey == nil || len(it.lastValidKey) == 0 {
 		return false
 	}
 	return it.Seek(it.lastValidKey)
 }
-
 
 func (it *Iterator) Next() bool {
 	bo := retry.NewBackoffer(context.WithValue(context.Background(), txnStartKey, it.version), scannerNextMaxBackoff)
@@ -832,11 +939,11 @@ func (it *Iterator) Prev() bool {
 	if it.idx == -1 {
 		return false
 	}
-	if it.idx == 0 && (len(it.startKeys) <= 1 || bytes.Compare(it.Key(), it.startKeys[0]) <= 0){
+	if it.idx == 0 && (len(it.startKeys) <= 1 || bytes.Compare(it.Key(), it.startKeys[0]) <= 0) {
 		it.idx = -1
 		return false
 	}
-	if it.idx >= len(it.cache){
+	if it.idx >= len(it.cache) {
 		it.idx = len(it.cache)
 	}
 	if it.idx > 0 {
@@ -874,10 +981,10 @@ func (i *Iterator) Release() {
 	i.valid = false
 }
 
-func (i *Iterator) markAtEnd()  {
+func (i *Iterator) markAtEnd() {
 	i.atEnd = true
 }
-func (i *Iterator) unMarkAtEnd()  {
+func (i *Iterator) unMarkAtEnd() {
 	i.atEnd = false
 }
 
@@ -961,75 +1068,76 @@ func (c *RawKVClient) getTimestamp(ctx context.Context) (uint64, error) {
 	return ComposeTS(physical, logical), nil
 }
 
-
-// NewBatch returns a Batch instance.
-func (c *RawKVClient)  NewBatch() Batch {
-	return &tikvBatch{
-		db: c,
-	}
-}
-
 func ComposeTS(physical, logical int64) uint64 {
 	return uint64((physical << physicalShiftBits) + logical)
 }
 
-// TiKV Batch
-type Batch interface {
-	Put(key, value []byte) error
-	Delete(key []byte) error
-	Write() error
-	Len() int
-}
-
-type KeyValuePair struct {
-	Key   []byte
-	Value []byte
-}
-
-// tikvBatch implements the Batch interface.
-type tikvBatch struct {
-	db     *RawKVClient
-	keys   [][]byte
-	values [][]byte
-}
-
-// Put appends 'put operation' of the given K/V pair to the batch.
-func (b *tikvBatch) Put(key, value []byte) error {
-	b.keys = append(b.keys, key)
-	b.values = append(b.values, value)
-	return nil
-}
-
-// TODO check it
-// Delete appends 'delete operation' of the given key to the batch.
-func (b *tikvBatch) Delete(key []byte) error {
-	for i := 0; i < len(b.keys); i++ {
-		if bytes.Compare(key, b.keys[i]) == 0 {
-			b.keys = append(b.keys[:i], b.keys[i+1:]...)
-			return nil
-		}
-	}
-	return nil
-}
-
-// Write apply the given batch to the DB.
-func (b *tikvBatch) Write() error {
-	if b.db == nil {
-		panic(fmt.Errorf("no db specified"))
-	}
-	return b.db.BatchPut(b.keys, b.values)
-}
-
-// Len returns number of records in the batch.
-func (b *tikvBatch) Len() int {
-	return len(b.keys)
-}
-
-func (b *tikvBatch) Parse() []KeyValuePair {
-	kv := make([]KeyValuePair, len(b.keys))
-	for i := 0; i < len(b.keys); i++ {
-		kv[i].Key = b.keys[i]
-		kv[i].Value = b.values[i]
-	}
-	return kv
-}
+//
+//// NewBatch returns a Batch instance.
+//func (c *RawKVClient)  NewBatch() Batch {
+//	return &tikvBatch{
+//		db: c,
+//	}
+//}
+//
+//
+//// TiKV Batch
+//type Batch interface {
+//	Put(key, value []byte) error
+//	Delete(key []byte) error
+//	Write() error
+//	Len() int
+//}
+//
+//type KeyValuePair struct {
+//	Key   []byte
+//	Value []byte
+//}
+//
+//// tikvBatch implements the Batch interface.
+//type tikvBatch struct {
+//	db     *RawKVClient
+//	keys   [][]byte
+//	values [][]byte
+//}
+//
+//// Put appends 'put operation' of the given K/V pair to the batch.
+//func (b *tikvBatch) Put(key, value []byte) error {
+//	b.keys = append(b.keys, key)
+//	b.values = append(b.values, value)
+//	return nil
+//}
+//
+//// TODO check it
+//// Delete appends 'delete operation' of the given key to the batch.
+//func (b *tikvBatch) Delete(key []byte) error {
+//	for i := 0; i < len(b.keys); i++ {
+//		if bytes.Compare(key, b.keys[i]) == 0 {
+//			b.keys = append(b.keys[:i], b.keys[i+1:]...)
+//			return nil
+//		}
+//	}
+//	return nil
+//}
+//
+//// Write apply the given batch to the DB.
+//func (b *tikvBatch) Write() error {
+//	if b.db == nil {
+//		panic(fmt.Errorf("no db specified"))
+//	}
+//	return b.db.BatchPut(b.keys, b.values)
+//}
+//
+//// Len returns number of records in the batch.
+//func (b *tikvBatch) Len() int {
+//	return len(b.keys)
+//}
+//
+//func (b *tikvBatch) Parse() []KeyValuePair {
+//	kv := make([]KeyValuePair, len(b.keys))
+//	for i := 0; i < len(b.keys); i++ {
+//		kv[i].Key = b.keys[i]
+//		kv[i].Value = b.values[i]
+//	}
+//	return kv
+//}
